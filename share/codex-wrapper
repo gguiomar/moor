@@ -1,0 +1,4 @@
+#!/bin/bash
+# Wrapper that bypasses codex's internal sandbox.
+# Only used INSIDE the moor Docker container — the container is the sandbox.
+exec /usr/local/bin/codex --dangerously-bypass-approvals-and-sandbox "$@"

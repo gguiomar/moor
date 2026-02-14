@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# moor — Run AI coding agents (Codex, etc.) inside a GPU-enabled Docker sandbox.
+# https://github.com/gguiomar/moor
+set -euo pipefail
+
+MOOR_VERSION="0.1.0"
+MOOR_RUNTIME_DIR="$HOME/.moor/run"
+MOOR_CACHE_DIR="$HOME/.cache"
+
+NAME="moor-sandbox"
+IMAGE="${MOOR_IMAGE:-moor/cuda:12.8.0-runtime-ubuntu24.04-tmux}"
+IMAGE_BUILD_DIR="${MOOR_IMAGE_BUILD_DIR:-}"
+CONDA_ENV="${1:-}"
+
+# ---------------------------------------------------------------------------
+# Docker command (auto-sudo if needed)
+# ---------------------------------------------------------------------------
+DOCKER=(docker)
+if ! docker ps >/dev/null 2>&1; then
+  if command -v sudo >/dev/null 2>&1; then
+    DOCKER=(sudo docker)
+  else
+    echo "moor: docker permission denied and sudo not available"; exit 1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Find host conda root
+# ---------------------------------------------------------------------------
+HOST_CONDA_ROOT=""
+for d in "$HOME/miniconda" "$HOME/miniconda3" "$HOME/anaconda3" \
+         "$HOME/mambaforge" "$HOME/miniforge3" "/opt/conda"; do
+  if [ -x "$d/bin/conda" ]; then
+    HOST_CONDA_ROOT="$d"
+    break
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+case "${CONDA_ENV}" in
+  --reset)
+    "${DOCKER[@]}" rm -f "$NAME" 2>/dev/null \
+      && echo "Removed container '$NAME'." \
+      || echo "No container to remove."
+    exit 0 ;;
+  --status)
+    "${DOCKER[@]}" ps -a --filter "name=^/${NAME}$" \
+      --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+    exit 0 ;;
+  --version|-V)
+    echo "moor $MOOR_VERSION"; exit 0 ;;
+  --help|-h)
+    cat <<EOF
+moor $MOOR_VERSION — GPU-sandboxed AI coding agent runner
+
+Usage:
+  moor [CONDA_ENV]       Create or attach to the sandbox container.
+                         Auto-detects a conda env matching the repo dir name.
+  moor --reset           Remove the sandbox container.
+  moor --status          Show container status.
+  moor --version         Print version.
+  moor --help            This message.
+
+Environment variables:
+  MOOR_IMAGE             Docker image to use (default: $IMAGE)
+  MOOR_IMAGE_BUILD_DIR   Path to a Dockerfile to build the image from
+
+Inside the container:
+  - Detach from tmux:    Ctrl+b then d
+  - Re-attach:           Just run moor again
+  - codex is aliased to  codex --dangerously-bypass-approvals-and-sandbox
+EOF
+    exit 0 ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Auto-detect conda env from repo dir name
+# ---------------------------------------------------------------------------
+if [ -z "$CONDA_ENV" ] && [ -n "$HOST_CONDA_ROOT" ]; then
+  repo_name="$(basename "$PWD")"
+  if [ -d "$HOST_CONDA_ROOT/envs/$repo_name" ]; then
+    CONDA_ENV="$repo_name"
+  fi
+fi
+
+# Resolve conda env paths
+CONDA_ENV_PATH=""
+CONDA_ENV_BIN=""
+if [ -n "$CONDA_ENV" ] && [ -n "$HOST_CONDA_ROOT" ]; then
+  CONDA_ENV_PATH="$HOST_CONDA_ROOT/envs/$CONDA_ENV"
+  if [ ! -d "$CONDA_ENV_PATH" ]; then
+    echo "moor: conda env '$CONDA_ENV' not found at $CONDA_ENV_PATH"
+    echo "Available envs:"; ls "$HOST_CONDA_ROOT/envs/" 2>/dev/null
+    exit 1
+  fi
+  CONDA_ENV_BIN="$CONDA_ENV_PATH/bin"
+fi
+
+# ---------------------------------------------------------------------------
+# Generate runtime files (passwd, group, shell init, codex wrapper)
+# ---------------------------------------------------------------------------
+mkdir -p "$MOOR_RUNTIME_DIR/bin" "$MOOR_CACHE_DIR"
+uid=$(id -u); gid=$(id -g)
+
+printf 'moor:x:%s:%s:moor:/home/moor:/bin/bash\n' "$uid" "$gid" \
+  > "$MOOR_RUNTIME_DIR/passwd"
+printf 'moor:x:%s:\n' "$gid" \
+  > "$MOOR_RUNTIME_DIR/group"
+
+# Codex wrapper — bypasses sandbox (Docker IS the sandbox)
+cat > "$MOOR_RUNTIME_DIR/bin/codex" << 'WRAPPER'
+#!/bin/bash
+exec /usr/local/bin/codex --dangerously-bypass-approvals-and-sandbox "$@"
+WRAPPER
+chmod +x "$MOOR_RUNTIME_DIR/bin/codex"
+
+# .bashrc — sourced by every interactive shell & tmux pane
+cat > "$MOOR_RUNTIME_DIR/bashrc" << BASHRC
+# moor container shell init
+export PATH="/home/moor/.moor/run/bin:\$PATH"
+
+# NVIDIA
+export LD_LIBRARY_PATH="/usr/local/nvidia/lib:/usr/local/nvidia/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+export NVIDIA_VISIBLE_DEVICES=all
+export NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# Conda
+if [ -n "\${HOST_CONDA_ROOT:-}" ] && [ -x "\${HOST_CONDA_ROOT}/bin/conda" ]; then
+  eval "\$("\${HOST_CONDA_ROOT}/bin/conda" shell.bash hook 2>/dev/null)"
+  ${CONDA_ENV:+conda activate "$CONDA_ENV" 2>/dev/null || true}
+fi
+BASHRC
+
+# .bash_profile — login shells source .bashrc
+cat > "$MOOR_RUNTIME_DIR/bash_profile" << 'PROFILE'
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+PROFILE
+
+# ---------------------------------------------------------------------------
+# Container PATH
+# ---------------------------------------------------------------------------
+CONTAINER_PATH="/home/moor/.moor/run/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+if [ -n "$HOST_CONDA_ROOT" ]; then
+  CONTAINER_PATH="${HOST_CONDA_ROOT}/bin:${HOST_CONDA_ROOT}/condabin:${CONTAINER_PATH}"
+fi
+if [ -n "$CONDA_ENV_BIN" ]; then
+  CONTAINER_PATH="${CONDA_ENV_BIN}:${CONTAINER_PATH}"
+fi
+
+# ---------------------------------------------------------------------------
+# Create container
+# ---------------------------------------------------------------------------
+create_container() {
+  if ! "${DOCKER[@]}" image inspect "$IMAGE" >/dev/null 2>&1; then
+    if [ -n "$IMAGE_BUILD_DIR" ] && [ -f "$IMAGE_BUILD_DIR/Dockerfile" ]; then
+      echo "Building image '$IMAGE'..."
+      "${DOCKER[@]}" build -t "$IMAGE" "$IMAGE_BUILD_DIR"
+    else
+      echo "moor: image '$IMAGE' not found."
+      echo "Build it first:  docker build -t $IMAGE <path-to-Dockerfile-dir>"
+      echo "Or set MOOR_IMAGE_BUILD_DIR to auto-build."
+      exit 1
+    fi
+  fi
+
+  local conda_mounts=()
+  if [ -n "$HOST_CONDA_ROOT" ]; then
+    conda_mounts+=( -v "$HOST_CONDA_ROOT":"$HOST_CONDA_ROOT":rw )
+  fi
+
+  local env_label="${CONDA_ENV:-base}"
+  echo "Creating container '$NAME' (repo: $PWD, env: $env_label)..."
+  "${DOCKER[@]}" run -d --name "$NAME" \
+    --gpus all \
+    --user "$uid:$gid" \
+    --security-opt seccomp=unconfined \
+    --pids-limit 4096 \
+    -v "$MOOR_RUNTIME_DIR/passwd":/etc/passwd:ro \
+    -v "$MOOR_RUNTIME_DIR/group":/etc/group:ro \
+    -v "$MOOR_RUNTIME_DIR/bashrc":/home/moor/.bashrc:ro \
+    -v "$MOOR_RUNTIME_DIR/bash_profile":/home/moor/.bash_profile:ro \
+    -v "$MOOR_RUNTIME_DIR/bin":/home/moor/.moor/run/bin:ro \
+    -v "$PWD":/work/repo:rw \
+    -v "$HOME/.codex":/home/moor/.codex:rw \
+    -v "$MOOR_CACHE_DIR":/home/moor/.cache:rw \
+    "${conda_mounts[@]}" \
+    -e HOME=/home/moor \
+    -e "HOST_CONDA_ROOT=$HOST_CONDA_ROOT" \
+    -e "CONDA_DEFAULT_ENV=${CONDA_ENV:-base}" \
+    -e "CONDA_PREFIX=${CONDA_ENV_PATH:-$HOST_CONDA_ROOT}" \
+    -e "PATH=$CONTAINER_PATH" \
+    -e "LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64" \
+    -e NVIDIA_VISIBLE_DEVICES=all \
+    -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    -w /work/repo \
+    "$IMAGE" \
+    sleep infinity >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Ensure container exists and is running
+# ---------------------------------------------------------------------------
+cid=$("${DOCKER[@]}" ps -a --filter "name=^/${NAME}$" --format '{{.ID}}')
+
+if [ -n "$cid" ]; then
+  mounted_dir=$("${DOCKER[@]}" inspect -f \
+    '{{range .Mounts}}{{if eq .Destination "/work/repo"}}{{.Source}}{{end}}{{end}}' "$cid")
+  if [ "$mounted_dir" != "$PWD" ]; then
+    echo "Container was bound to '$mounted_dir', but you're in '$PWD'."
+    echo "Recreating container for this directory..."
+    "${DOCKER[@]}" rm -f "$cid" >/dev/null
+    cid=""
+  fi
+fi
+
+if [ -z "$cid" ]; then
+  create_container
+elif [ "$("${DOCKER[@]}" inspect -f '{{.State.Running}}' "$cid")" != "true" ]; then
+  echo "Starting '$NAME'..."
+  "${DOCKER[@]}" start "$cid" >/dev/null
+fi
+
+# ---------------------------------------------------------------------------
+# Attach via tmux
+# ---------------------------------------------------------------------------
+echo "Attaching to '$NAME'...  (detach: Ctrl+b then d)"
+"${DOCKER[@]}" exec -it \
+  -e HOME=/home/moor \
+  -e "HOST_CONDA_ROOT=${HOST_CONDA_ROOT}" \
+  -e "PATH=$CONTAINER_PATH" \
+  -e "LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64" \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+  "$NAME" bash -lc '
+  if command -v tmux >/dev/null 2>&1; then
+    if tmux has-session -t moor 2>/dev/null; then
+      exec tmux attach -t moor
+    else
+      exec tmux new -s moor
+    fi
+  else
+    exec bash -l
+  fi
+'
