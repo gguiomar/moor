@@ -82,6 +82,10 @@ inside the container, `codex` is wrapped to bypass its internal sandbox automati
 |---|---|---|
 | `MOOR_IMAGE` | `moor/cuda:12.8.0-runtime-ubuntu24.04-tmux` | docker image to use |
 | `MOOR_IMAGE_BUILD_DIR` | _(none)_ | auto-build from this dockerfile directory |
+| `MOOR_HOST_SSH_DIR` | `~/.ssh` | optional host SSH key directory to mount in container at `/home/moor/.ssh` |
+
+To push using SSH, keep your repo mounted as before and run `moor` from the repo directory.
+By default moor mounts your host SSH directory, so `git push` works without re-authenticating.
 
 ## cargo manifest
 

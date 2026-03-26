@@ -6,6 +6,7 @@ set -euo pipefail
 MOOR_VERSION="0.1.0"
 MOOR_RUNTIME_DIR="$HOME/.moor/run"
 MOOR_CACHE_DIR="$HOME/.cache"
+HOST_SSH_DIR="${MOOR_HOST_SSH_DIR:-$HOME/.ssh}"
 
 NAME="moor-sandbox"
 IMAGE="${MOOR_IMAGE:-moor/cuda:12.8.0-runtime-ubuntu24.04-tmux}"
@@ -169,6 +170,11 @@ create_container() {
   if [ -n "$HOST_CONDA_ROOT" ]; then
     conda_mounts+=( -v "$HOST_CONDA_ROOT":"$HOST_CONDA_ROOT":rw )
   fi
+  
+  local ssh_mount=()
+  if [ -d "$HOST_SSH_DIR" ]; then
+    ssh_mount+=( -v "$HOST_SSH_DIR":/home/moor/.ssh:ro )
+  fi
 
   local env_label="${CONDA_ENV:-base}"
   echo "Creating container '$NAME' (repo: $PWD, env: $env_label)..."
@@ -184,6 +190,7 @@ create_container() {
     -v "$MOOR_RUNTIME_DIR/bin":/home/moor/.moor/run/bin:ro \
     -v "$PWD":/work/repo:rw \
     -v "$HOME/.codex":/home/moor/.codex:rw \
+    "${ssh_mount[@]}" \
     -v "$MOOR_CACHE_DIR":/home/moor/.cache:rw \
     "${conda_mounts[@]}" \
     -e HOME=/home/moor \
